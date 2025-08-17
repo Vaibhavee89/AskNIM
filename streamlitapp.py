@@ -32,7 +32,7 @@ def vector_embedding():
 
 
 st.title("Nvidia NIM Demo")
-llm = ChatNVIDIA(model="meta/llama3-70b-instruct")
+llm = ChatNVIDIA(model="openai/gpt-oss-120b", temperature=0.1, max_tokens=1024)
 
 
 prompt=ChatPromptTemplate.from_template(
