@@ -100,6 +100,7 @@ def build_index(data_dir: str) -> Dict[str, Any]:
 # ----------------------------
 llm = ChatNVIDIA(model=MODEL_NAME, temperature=0.1, max_tokens=1024)
 
+# Primary prompt: prefer grounded answers from Context (RAG)
 ANSWER_PROMPT = ChatPromptTemplate.from_template(
     """
 You are a careful clinical information assistant.
@@ -116,6 +117,35 @@ Return strictly valid JSON with keys:
 
 Context:
 {context}
+
+Question: {input}
+
+JSON:
+    """
+)
+
+# Fallback prompt: allow general medical knowledge (no documents) with strict safety rules
+GENERAL_PROMPT = ChatPromptTemplate.from_template(
+    """
+You are a careful clinical information assistant.
+
+Your task is to answer the user’s medical question using:
+1. Your general medical knowledge.
+2. Provided documents (if any) in {context}.
+
+Follow these rules:
+- Do NOT diagnose, prescribe, or give exact dosages.
+- Be conservative and cautious. If urgent care might be needed, state this clearly.
+- Use patient-friendly language with short, clear sentences.
+- Stick to evidence-based, widely accepted guidance.
+- If information is uncertain or varies by patient, say so explicitly.
+
+Output format:
+Return a strictly valid JSON object with these keys:
+- "answer": string (≤150 words; clear and concise)
+- "red_flags": string ("none" if not applicable)
+- "confidence": one of ["low", "medium", "high"]
+- "sources": array of objects, each with {"file": string, "page": number}; leave empty if no documents cited
 
 Question: {input}
 
@@ -215,7 +245,7 @@ if ask_clicked and user_q:
         search_kwargs={"k": TOP_K, "fetch_k": FETCH_K, "lambda_mult": LAMBDA_MMR},
     )
 
-    # Chain
+    # Chain (RAG first)
     doc_chain = create_stuff_documents_chain(llm, ANSWER_PROMPT)
     chain = create_retrieval_chain(retriever, doc_chain)
 
@@ -227,6 +257,20 @@ if ask_clicked and user_q:
     ctx_docs = result.get("context", [])
 
     parsed = parse_llm_json(raw_answer)
+
+    # Decide routing: if RAG was weak -> general knowledge fallback
+    mode = "RAG"
+    rag_conf = str(parsed.get("confidence", "low")).lower()
+    says_unknown = "don't know" in parsed.get("answer", "").lower() or "not enough information" in parsed.get("answer", "").lower()
+    if rag_conf == "low" or says_unknown or len(ctx_docs) == 0:
+        mode = "General"
+        # For general knowledge fallback, invoke the LLM directly with the prompt
+        gen_raw = llm.invoke(GENERAL_PROMPT.format(input=user_q))
+        gen_parsed = parse_llm_json(gen_raw.content)
+        # Ensure sources empty for general answers
+        if not isinstance(gen_parsed.get("sources", []), list):
+            gen_parsed["sources"] = []
+        parsed = gen_parsed
 
     # Render
     col1, col2 = st.columns([2, 1])
@@ -244,22 +288,29 @@ if ask_clicked and user_q:
             st.info("Confidence: medium")
         else:
             st.warning("Confidence: low")
+        st.caption(f"Mode: {mode}")
 
     with col2:
         st.metric("Response time (s)", f"{dt:.2f}")
-        render_sources(ctx_docs, parsed.get("sources", []))
+        if mode == "RAG":
+            render_sources(ctx_docs, parsed.get("sources", []))
+        else:
+            st.subheader("Sources")
+            st.write("General medical knowledge (no specific document citations).")
 
     with st.expander("Show relevant context chunks"):
-        for i, doc in enumerate(ctx_docs, start=1):
-            src = os.path.basename(str(doc.metadata.get("source", "unknown")))
-            page = doc.metadata.get("page", "?" )
-            st.markdown(f"**Chunk {i}: {src} — p.{page}**")
-            # Avoid printing potential PHI-heavy lines in logs; show in UI only
-            st.write(doc.page_content)
-            st.write("\n---\n")
+        if mode == "RAG":
+            for i, doc in enumerate(ctx_docs, start=1):
+                src = os.path.basename(str(doc.metadata.get("source", "unknown")))
+                page = doc.metadata.get("page", "?")
+                st.markdown(f"**Chunk {i}: {src} — p.{page}**")
+                st.write(doc.page_content)
+                st.write("\n---\n")
+        else:
+            st.write("No document context used for this answer.")
 
 # Footer disclaimer
 st.caption(
-    "This assistant summarizes information from your uploaded documents only and may be incomplete or outdated. "
-    "Always consult a qualified clinician for diagnosis and treatment."
+    "This assistant may answer using your uploaded documents (RAG) or general medical knowledge. "
+    "It is not a substitute for professional medical advice, diagnosis, or treatment."
 )
